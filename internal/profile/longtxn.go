@@ -49,11 +49,13 @@ func (o *longTxnObserver) run(ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
+// poll records relation names unquoted (schema.Name), the same form the
+// relationResolver produces, so Tables from both sources compare equal.
 func (o *longTxnObserver) poll(ctx context.Context, pool *pgxpool.Pool) {
 	rows, err := pool.Query(ctx, `/* pg-rehearse:profile */
 SELECT a.pid, a.xact_start, coalesce(a.query, ''),
   extract(epoch FROM (pg_catalog.clock_timestamp() - a.xact_start))::float8,
-  coalesce((SELECT array_agg(DISTINCT pg_catalog.format('%I.%I', n.nspname, c.relname))
+  coalesce((SELECT array_agg(DISTINCT n.nspname || '.' || c.relname)
             FROM pg_catalog.pg_locks l
             JOIN pg_catalog.pg_class c ON c.oid = l.relation
             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace

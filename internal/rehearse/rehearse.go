@@ -75,6 +75,7 @@ func (o *Options) defaults() {
 const (
 	dangerousStall = time.Second
 	riskyStall     = 200 * time.Millisecond
+	slowQueryMs    = 250.0
 )
 
 func Run(ctx context.Context, opts Options) (*model.Report, error) {
@@ -291,7 +292,7 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 	}
 	defer pool.Close()
 
-	longStart := opts.Warmup - 1500*time.Millisecond
+	longStart := opts.Warmup - 300*time.Millisecond // worst case: the long transaction has just started
 	if longStart < 0 {
 		longStart = 0
 	}
@@ -328,7 +329,7 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 	// 3. Apply the migration on its own connection, mid-traffic.
 	logf("[%s] applying migration under load", label)
 	migStart := time.Now()
-	migErr := applyMigration(ctx, dsn, migration)
+	migErr := applyMigration(ctx, dsn, migration, label == "fixed")
 	migEnd := time.Now()
 
 	logf("[%s] observing for %s", label, opts.Observe)
@@ -361,14 +362,17 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 	return res, nil
 }
 
-func applyMigration(ctx context.Context, dsn, migration string) error {
+// applyMigration runs the original migration in one transaction (what most
+// migration tools do). Fixed migrations run statement by statement so that
+// NOT VALID + VALIDATE splits release their locks between steps.
+func applyMigration(ctx context.Context, dsn, migration string, stepwise bool) error {
 	c, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer c.Close(ctx)
 	stmts := locks.SplitStatements(migration)
-	if nonTxRe.MatchString(migration) {
+	if stepwise || nonTxRe.MatchString(migration) {
 		for _, s := range stmts {
 			if _, err := c.Exec(ctx, s); err != nil {
 				return fmt.Errorf("%s: %w", firstLine(s), err)
@@ -413,6 +417,11 @@ func impacts(lr *model.LoadResult, qs []model.QueryProfile, from, to time.Time, 
 	var out []model.Impact
 	for _, q := range qs {
 		samples := byQ[q.QueryID]
+		// Slow background queries (reports, batch jobs) are not interactive
+		// traffic: their own runtime would read as a "stall".
+		if q.MeanMs >= slowQueryMs {
+			continue
+		}
 		if len(samples) == 0 {
 			continue
 		}

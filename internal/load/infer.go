@@ -30,7 +30,9 @@ type token struct {
 	cast   string // for tParam: type of a directly following ::cast, if any
 }
 
-func (t token) is(s string) bool { return (t.kind == tIdent && !t.quoted || t.kind == tOp) && t.text == s }
+func (t token) is(s string) bool {
+	return (t.kind == tIdent && !t.quoted || t.kind == tOp) && t.text == s
+}
 
 // tokenize splits SQL into tokens, skipping whitespace and comments.
 func tokenize(sql string) ([]token, error) {

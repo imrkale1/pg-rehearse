@@ -31,17 +31,73 @@ const (
 	RuleTableRewrite    = "table-rewrite"
 )
 
-// migrationState tracks facts that depend on statement order.
-type migrationState struct {
-	created map[string]bool // tables created earlier in this migration (normalized, and bare names)
+// MigrationState tracks facts that depend on statement order: tables created
+// earlier in the migration, and columns proven NOT NULL by a validated
+// CHECK (col IS NOT NULL) constraint (which makes SET NOT NULL scan-free).
+type MigrationState struct {
+	created map[string]bool   // tables created earlier in this migration (normalized, and bare names)
+	checks  map[string]string // table|constraint -> column, for CHECK (col IS NOT NULL) constraints
+	proven  map[string]bool   // table|column proven NOT NULL by a validated CHECK
 }
 
-func newState() *migrationState { return &migrationState{created: map[string]bool{}} }
+type migrationState = MigrationState
+
+// NewMigrationState returns an empty state; feed it statements in order with Observe.
+func NewMigrationState() *MigrationState { return newState() }
+
+func newState() *migrationState {
+	return &migrationState{created: map[string]bool{}, checks: map[string]string{}, proven: map[string]bool{}}
+}
+
+// Observe records the effects of a statement. Call it after inspecting the statement.
+func (m *MigrationState) Observe(st *Statement) { m.observe(st) }
+
+// IsNew reports whether the table was created earlier in the same migration.
+func (m *MigrationState) IsNew(table string) bool { return m.isNew(table) }
+
+// NotNullProven reports whether a validated CHECK (column IS NOT NULL)
+// constraint was established earlier in the migration, so SET NOT NULL on
+// that column does not scan the table (PG12+).
+func (m *MigrationState) NotNullProven(table, column string) bool {
+	return m.proven[BareName(table)+"|"+BareName(column)]
+}
 
 func (m *migrationState) observe(st *Statement) {
 	if st.Kind == StmtCreateTable && st.Table != "" {
 		m.created[NormIdent(st.Table)] = true
 		m.created[BareName(st.Table)] = true
+	}
+	if st.Kind != StmtAlterTable {
+		return
+	}
+	tbl := BareName(st.Table)
+	for i := range st.Actions {
+		a := &st.Actions[i]
+		t := a.toks
+		switch a.Kind {
+		case ActAddConstraint:
+			if a.ConstraintType != "CHECK" || a.ConstraintName == "" {
+				continue
+			}
+			// ... CHECK ( col IS NOT NULL ) [NOT VALID]
+			for k := 0; k+6 < len(t); k++ {
+				if t[k].upper() == "CHECK" && isOp(t, k+1, "(") && isIdentTok(t[k+2]) && wordAt(t, k+3) == "IS" &&
+					wordAt(t, k+4) == "NOT" && wordAt(t, k+5) == "NULL" && isOp(t, k+6, ")") {
+					col := BareName(t[k+2].Text)
+					if a.NotValid {
+						m.checks[tbl+"|"+BareName(a.ConstraintName)] = col
+					} else {
+						m.proven[tbl+"|"+col] = true
+					}
+				}
+			}
+		case ActValidate:
+			if len(t) >= 3 && wordAt(t, 1) == "CONSTRAINT" {
+				if col, ok := m.checks[tbl+"|"+BareName(t[2].Text)]; ok {
+					m.proven[tbl+"|"+col] = true
+				}
+			}
+		}
 	}
 }
 
@@ -116,14 +172,14 @@ func Lint(migrationSQL string) []model.LintFinding {
 		}
 
 		if existing {
-			lintStatement(&st, add)
+			lintStatement(&st, state, add)
 		}
 		state.observe(&st)
 	}
 	return out
 }
 
-func lintStatement(st *Statement, add func(rule string, sev model.Severity, stmt, msg, sugg string)) {
+func lintStatement(st *Statement, state *migrationState, add func(rule string, sev model.Severity, stmt, msg, sugg string)) {
 	sql := st.SQL
 	switch st.Kind {
 	case StmtCreateIndex:
@@ -150,6 +206,9 @@ func lintStatement(st *Statement, add func(rule string, sev model.Severity, stmt
 			"Use pg_repack --order-by for an online re-cluster, or skip it.")
 	case StmtAlterTable:
 		for _, a := range st.Actions {
+			if a.Kind == ActSetNotNull && state.NotNullProven(st.Table, a.Column) {
+				continue // a validated CHECK (col IS NOT NULL) makes this scan-free
+			}
 			lintAction(st, &a, add)
 		}
 	}

@@ -133,6 +133,17 @@ func Analyze(ctx context.Context, pool *pgxpool.Pool, migrationSQL string) (fp *
 	return fp, nil
 }
 
+// existed reports whether a qualified relation name (as produced by
+// resolve) existed before the migration started.
+func (s *session) existed(name string) bool {
+	for _, ri := range s.rels {
+		if ri.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *session) snapshotRels(ctx context.Context) error {
 	rows, err := s.conn.Query(ctx, userRelsSQL)
 	if err != nil {
@@ -369,6 +380,9 @@ func withoutConcurrently(st *Statement) string {
 // run inside a transaction block.
 func (s *session) analyzeStatic(ctx context.Context, st *Statement, sl model.StatementLocks) (model.StatementLocks, *model.LintFinding, error) {
 	add := func(name, kind, mode string) {
+		if !s.existed(name) {
+			return // created by this migration: invisible to other sessions
+		}
 		sl.Locks = append(sl.Locks, relationLock(name, kind, mode))
 	}
 	switch st.Kind {

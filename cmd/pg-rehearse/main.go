@@ -107,11 +107,11 @@ func profileCmd() *cobra.Command {
 func rehearseCmd() *cobra.Command {
 	var (
 		profPath, shadow, migPath, format, outPath, failOn string
-		scale, rate                                       float64
-		duration                                          time.Duration
-		seed                                              int64
-		rebuild, noFix                                    bool
-		conns                                             int
+		scale, rate                                        float64
+		duration                                           time.Duration
+		seed                                               int64
+		rebuild, noFix                                     bool
+		conns                                              int
 	)
 	c := &cobra.Command{
 		Use:   "rehearse",

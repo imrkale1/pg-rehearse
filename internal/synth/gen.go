@@ -91,12 +91,13 @@ func (g *nullGen) fill(_ *rand.Rand, _ int64, out []value) {
 type seqGen struct {
 	idx   int
 	start int64
+	step  int64
 }
 
 func (g *seqGen) fill(_ *rand.Rand, row int64, out []value) {
 	o := &out[g.idx]
 	o.null = false
-	o.b = strconv.AppendInt(o.b[:0], g.start+row, 10)
+	o.b = strconv.AppendInt(o.b[:0], g.start+row*g.step, 10)
 }
 
 // ---------- foreign key generator ----------
@@ -618,8 +619,8 @@ func (v uuidValuer) gen(buf []byte, q float64, k int64, unique bool) []byte {
 		// Make injective: low 64 bits carry k verbatim (mixed bijectively).
 		b = splitmix64(uint64(k)) ^ 0 // splitmix64 is a bijection on uint64
 	}
-	a = (a &^ 0xf000) | 0x4000            // version 4
-	b = (b &^ (3 << 62)) | (1 << 63)      // variant 10
+	a = (a &^ 0xf000) | 0x4000       // version 4
+	b = (b &^ (3 << 62)) | (1 << 63) // variant 10
 	if unique {
 		// The variant bits overwrote 2 bits of b; fold them into a so that
 		// distinct k stay distinct.

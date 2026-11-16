@@ -59,12 +59,13 @@ type Action struct {
 
 	// ADD COLUMN details:
 	IfNotExists     bool
-	ColumnType      string // type text as written
-	Default         string // DEFAULT expression text as written
-	VolatileDefault bool   // DEFAULT uses a volatile function or the column is serial/identity/stored-generated
-	ColumnRest      string // column constraints other than DEFAULT, as written (may contain NOT NULL)
-	InlineUnique    bool   // column definition contains UNIQUE or PRIMARY KEY (builds an index)
-	NewName         string // RENAME ... TO <NewName>
+	ColumnType      string   // type text as written
+	Default         string   // DEFAULT expression text as written
+	VolatileDefault bool     // DEFAULT uses a volatile function or the column is serial/identity/stored-generated
+	ColumnRest      string   // column constraints other than DEFAULT, as written (may contain NOT NULL)
+	ColumnClauses   []string // the clauses making up ColumnRest, one per constraint, as written
+	InlineUnique    bool     // column definition contains UNIQUE or PRIMARY KEY (builds an index)
+	NewName         string   // RENAME ... TO <NewName>
 
 	toks []token
 }
@@ -634,6 +635,7 @@ func (st *Statement) parseAction(t []token) Action {
 				}
 				i = j
 			}
+			a.ColumnClauses = rest
 			a.ColumnRest = strings.Join(rest, " ")
 		}
 	case "ALTER":

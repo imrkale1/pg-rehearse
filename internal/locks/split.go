@@ -159,7 +159,7 @@ func lex(s string) []token {
 
 // scanQuoted returns the offset just past the closing quote of a quoted
 // construct starting at s[start] == q. Doubled quotes are escapes; with
-// backslash=true a backslash escapes the next byte too (E'' strings).
+// backslash=true a backslash escapes the next byte too (E” strings).
 func scanQuoted(s string, start int, q byte, backslash bool) int {
 	j := start + 1
 	for j < len(s) {
@@ -206,7 +206,7 @@ func dollarTag(s string, i int) (string, bool) {
 }
 
 // SplitStatements splits a migration into individual statements. It
-// understands single/double quotes, E'' escape strings, dollar-quoted bodies
+// understands single/double quotes, E” escape strings, dollar-quoted bodies
 // ($$ and $tag$), line and (nested) block comments, and SQL-standard
 // BEGIN ATOMIC ... END function bodies. Returned statements are trimmed, have
 // no trailing semicolon, keep their interior/leading comments, and
@@ -224,6 +224,23 @@ func SplitStatements(sql string) []string {
 type segment struct {
 	text        string
 	commentOnly bool
+}
+
+// Segment is one fragment of a migration: a statement (without trailing
+// semicolon) or a comment-only fragment.
+type Segment struct {
+	Text        string
+	CommentOnly bool
+}
+
+// SplitSegments is SplitStatements but keeps comment-only fragments, so a
+// rewriter can preserve explanatory comments.
+func SplitSegments(sql string) []Segment {
+	var out []Segment
+	for _, s := range splitSegments(sql) {
+		out = append(out, Segment{Text: s.text, CommentOnly: s.commentOnly})
+	}
+	return out
 }
 
 // splitSegments is SplitStatements but keeps comment-only fragments (used by
@@ -245,7 +262,7 @@ func splitSegments(sql string) []segment {
 		if t.Kind == tkComment {
 			continue
 		}
-		if first < 0 {
+		if first < 0 && !(t.Kind == tkOp && t.Text == ";" && atomicDepth == 0) {
 			first = idx
 		}
 		switch {
