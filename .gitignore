@@ -1,0 +1,4 @@
+/bin/
+/dist/
+*.profile.json
+.DS_Store
