@@ -18,6 +18,7 @@ import (
 	"github.com/pg-rehearse/pg-rehearse/internal/profile"
 	"github.com/pg-rehearse/pg-rehearse/internal/rehearse"
 	"github.com/pg-rehearse/pg-rehearse/internal/report"
+	"github.com/pg-rehearse/pg-rehearse/internal/telemetry"
 )
 
 var version = "dev"
@@ -37,6 +38,18 @@ func main() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	// OpenTelemetry (traces + metrics over OTLP). No-op unless
+	// OTEL_EXPORTER_OTLP_ENDPOINT is set, so it costs nothing by default.
+	shutdown, err := telemetry.Setup(ctx, "pg-rehearse")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pg-rehearse: telemetry disabled:", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(sctx)
+	}()
+
 	root.AddCommand(profileCmd(), rehearseCmd(), lintCmd())
 	if err := root.ExecuteContext(ctx); err != nil {
 		if e, ok := err.(exitError); ok {

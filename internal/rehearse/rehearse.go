@@ -27,6 +27,9 @@ import (
 	"github.com/pg-rehearse/pg-rehearse/internal/locks"
 	"github.com/pg-rehearse/pg-rehearse/internal/model"
 	"github.com/pg-rehearse/pg-rehearse/internal/synth"
+	"github.com/pg-rehearse/pg-rehearse/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type Options struct {
@@ -85,16 +88,25 @@ func Run(ctx context.Context, opts Options) (*model.Report, error) {
 	}
 	logf := func(format string, a ...any) { fmt.Fprintf(opts.Log, "pg-rehearse: "+format+"\n", a...) }
 
+	ctx, span := telemetry.StartSpan(ctx, "rehearse.run")
+	defer span.End()
+	metrics := telemetry.NewMetrics()
+
 	tpl, err := ensureTemplate(ctx, opts, logf)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ensure template")
 		return nil, err
 	}
 
 	logf("rehearsing original migration")
 	orig, err := rehearseOnce(ctx, opts, tpl, opts.MigrationSQL, "orig", logf)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
+	metrics.RecordRehearsal(ctx, "original", string(orig.Verdict), orig.MigrationDurationMs, orig.MaxStallMs)
+	span.SetAttributes(attribute.String("original.verdict", string(orig.Verdict)))
 	rep := &model.Report{Original: *orig, TrafficNote: trafficNote(opts)}
 
 	if orig.Verdict == model.VerdictSafe && len(dangerLint(orig.Footprint.Lint)) == 0 {
@@ -108,8 +120,11 @@ func Run(ctx context.Context, opts Options) (*model.Report, error) {
 	logf("re-testing safer migration")
 	fr, err := rehearseOnce(ctx, opts, tpl, fixed, "fixed", logf)
 	if err != nil {
+		span.RecordError(err)
 		return nil, fmt.Errorf("re-testing fix: %w", err)
 	}
+	metrics.RecordRehearsal(ctx, "fixed", string(fr.Verdict), fr.MigrationDurationMs, fr.MaxStallMs)
+	span.SetAttributes(attribute.String("fixed.verdict", string(fr.Verdict)))
 	rep.FixedResult = fr
 	return rep, nil
 }
@@ -259,6 +274,9 @@ func cloneTemplate(ctx context.Context, opts Options, tpl, suffix string) (strin
 var nonTxRe = regexp.MustCompile(`(?i)\b(CONCURRENTLY|VACUUM)\b|\bALTER\s+TYPE\b.*\bADD\s+VALUE\b`)
 
 func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label string, logf func(string, ...any)) (*model.RehearsalResult, error) {
+	ctx, span := telemetry.StartSpan(ctx, "rehearse.once", "phase", label)
+	defer span.End()
+
 	db, cleanup, err := cloneTemplate(ctx, opts, tpl, label)
 	if err != nil {
 		return nil, err
@@ -270,11 +288,14 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 	}
 
 	// 1. Static + lock footprint (BEGIN ... ROLLBACK, so the clone is unchanged).
-	apool, err := pgxpool.New(ctx, dsn)
+	actx, aspan := telemetry.StartSpan(ctx, "rehearse.analyze_locks")
+	apool, err := pgxpool.New(actx, dsn)
 	if err != nil {
+		aspan.End()
 		return nil, err
 	}
-	fp, err := locks.Analyze(ctx, apool, migration)
+	fp, err := locks.Analyze(actx, apool, migration)
+	aspan.End()
 	apool.Close()
 	if err != nil {
 		return nil, fmt.Errorf("lock analysis: %w", err)
@@ -328,9 +349,14 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 
 	// 3. Apply the migration on its own connection, mid-traffic.
 	logf("[%s] applying migration under load", label)
+	mctx, mspan := telemetry.StartSpan(ctx, "rehearse.apply_migration")
 	migStart := time.Now()
-	migErr := applyMigration(ctx, dsn, migration, label == "fixed")
+	migErr := applyMigration(mctx, dsn, migration, label == "fixed")
 	migEnd := time.Now()
+	if migErr != nil {
+		mspan.RecordError(migErr)
+	}
+	mspan.End()
 
 	logf("[%s] observing for %s", label, opts.Observe)
 	select {
@@ -358,6 +384,11 @@ func rehearseOnce(ctx context.Context, opts Options, tpl, migration, label strin
 		}
 	}
 	res.Verdict = verdict(res)
+	span.SetAttributes(
+		attribute.String("verdict", string(res.Verdict)),
+		attribute.Float64("max_stall_ms", res.MaxStallMs),
+		attribute.Float64("migration_ms", res.MigrationDurationMs),
+	)
 	logf("[%s] verdict %s (max stall %.0fms, migration %.0fms)", label, res.Verdict, res.MaxStallMs, res.MigrationDurationMs)
 	return res, nil
 }

@@ -93,6 +93,27 @@ Column value samples from `pg_stats` are dropped for anything that looks like PI
 
 ---
 
+## Observability
+
+The orchestrator is instrumented with **OpenTelemetry**: it emits a span per
+rehearsal phase (`rehearse.run` → `rehearse.once` → `rehearse.analyze_locks`,
+`rehearse.apply_migration`) and metrics for the numbers that matter —
+`pgr.migration.duration`, `pgr.rehearsal.max_stall`, and a
+`pgr.rehearsal.verdicts` counter by phase and severity. Export is opt-in over
+OTLP, so it works with the **Datadog Agent**, an OpenTelemetry Collector, Jaeger,
+or any OTLP backend, and is a no-op (zero cost) when unconfigured:
+
+```bash
+# Datadog Agent / OTel Collector listening on :4318
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=ci,service.version=1.0.0
+./bin/pg-rehearse rehearse --profile shop.profile.json --shadow-dsn ... --migration m.sql
+```
+
+Traces show where a rehearsal spends its time (building the copy vs. analyzing
+locks vs. driving traffic); the verdict counter and stall histogram let you
+track, across many PRs, how often migrations would have caused an outage.
+
 ## Use it in CI
 
 [`action.yml`](action.yml) is a composite GitHub Action, and
