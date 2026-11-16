@@ -1,0 +1,141 @@
+name: pg-rehearse
+description: >-
+  Rehearse changed Postgres migrations on a synthetic, production-shaped shadow
+  database under realistic traffic, and post the result as a sticky PR comment.
+branding:
+  icon: database
+  color: blue
+
+inputs:
+  migrations:
+    description: Git pathspec glob selecting migration files (only files changed in the PR are rehearsed).
+    default: "migrations/**/*.sql"
+  profile:
+    description: Path to a profile.json captured with `pg-rehearse profile` against production.
+    required: true
+  shadow-dsn:
+    description: DSN of an empty, disposable Postgres (e.g. a `services:` container). It will be overwritten.
+    required: true
+  scale:
+    description: Fraction of production row counts to synthesize.
+    default: "0.1"
+  duration:
+    description: How long to replay traffic around each migration.
+    default: "30s"
+  fail-on:
+    description: "Fail the job on this verdict or worse: dangerous, risky, or never."
+    default: dangerous
+  github-token:
+    description: Token used to post the PR comment (needs pull-requests:write).
+    default: ${{ github.token }}
+
+outputs:
+  verdict:
+    description: Worst verdict across rehearsed migrations (safe, risky, dangerous, error, none).
+    value: ${{ steps.rehearse.outputs.verdict }}
+  report:
+    description: Path to the combined Markdown report.
+    value: ${{ steps.rehearse.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache-dependency-path: ${{ github.action_path }}/go.sum
+
+    - name: Build pg-rehearse
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: go build -o "$RUNNER_TEMP/pg-rehearse" ./cmd/pg-rehearse
+
+    - name: Detect changed migrations
+      id: changed
+      shell: bash
+      env:
+        PATTERN: ${{ inputs.migrations }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if [ -z "$BASE_REF" ]; then
+          echo "::error::pg-rehearse must run on pull_request events"; exit 1
+        fi
+        # Needs history: use actions/checkout with fetch-depth: 0.
+        git fetch --no-tags --depth=1 origin "$BASE_REF" >/dev/null 2>&1 || true
+        git diff --name-only --diff-filter=AM "origin/$BASE_REF...HEAD" -- ":(glob)$PATTERN" | sort > "$RUNNER_TEMP/pgr-changed.txt"
+        echo "Changed migrations:"; cat "$RUNNER_TEMP/pgr-changed.txt"
+        echo "count=$(wc -l < "$RUNNER_TEMP/pgr-changed.txt" | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+    - name: Rehearse
+      id: rehearse
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        SHADOW_DSN: ${{ inputs.shadow-dsn }}
+        SCALE: ${{ inputs.scale }}
+        DURATION: ${{ inputs.duration }}
+      run: |
+        report="$RUNNER_TEMP/pg-rehearse-report.md"
+        echo "<!-- pg-rehearse:sticky -->" > "$report"
+        worst=safe
+        rank() { case "$1" in error) echo 3;; dangerous) echo 2;; risky) echo 1;; *) echo 0;; esac; }
+        while IFS= read -r file; do
+          [ -n "$file" ] || continue
+          echo "::group::rehearse $file"
+          out="$RUNNER_TEMP/one.md"
+          if "$RUNNER_TEMP/pg-rehearse" rehearse \
+              --profile "$PROFILE" --shadow-dsn "$SHADOW_DSN" --migration "$file" \
+              --scale "$SCALE" --duration "$DURATION" --format markdown > "$out"; then :; else
+            # A non-zero exit with a rendered report is a verdict; without one it is a tool failure.
+            [ -s "$out" ] || printf '### ⚠️ pg-rehearse could not rehearse `%s`\n\nSee the job log for details.\n' "$file" > "$out"
+          fi
+          echo "::endgroup::"
+          # The first heading of each report carries the verdict icon.
+          head_line="$(grep -m1 '^### ' "$out" || true)"
+          v=safe
+          case "$head_line" in
+            *🔴*) v=dangerous ;;
+            *🟠*) v=risky ;;
+            *💥*|*⚠️*) v=error ;;
+          esac
+          [ "$(rank "$v")" -gt "$(rank "$worst")" ] && worst=$v
+          { echo; cat "$out"; echo; } >> "$report"
+        done < "$RUNNER_TEMP/pgr-changed.txt"
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        echo "verdict=$worst" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+
+    - name: Post sticky PR comment
+      if: steps.changed.outputs.count != '0' && github.event.pull_request.number
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        REPORT: ${{ steps.rehearse.outputs.report }}
+      run: |
+        marker='<!-- pg-rehearse:sticky -->'
+        ids="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+              --jq ".[] | select(.body | contains(\"$marker\")) | .id")"
+        id="${ids%%$'\n'*}"
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$REPORT" >/dev/null
+          echo "Updated comment $id"
+        else
+          gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$REPORT" >/dev/null
+          echo "Created comment"
+        fi
+
+    - name: Enforce fail-on
+      if: steps.changed.outputs.count != '0'
+      shell: bash
+      env:
+        VERDICT: ${{ steps.rehearse.outputs.verdict }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        case "$FAIL_ON:$VERDICT" in
+          never:*) exit 0 ;;
+          risky:risky|risky:dangerous|risky:error|dangerous:dangerous|dangerous:error)
+            echo "::error::pg-rehearse verdict: $VERDICT (fail-on: $FAIL_ON)"; exit 1 ;;
+        esac

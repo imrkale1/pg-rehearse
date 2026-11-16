@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pgr_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pgr_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGR_TEST_DSN: postgres://postgres:postgres@localhost:5432/pgr_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then echo "::error::gofmt needed on:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race -count=1 ./...
+      - name: build
+        run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    # Advisory only: does not block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  demo-smoke:
+    # Proves the demo environment still seeds and the traffic generator still runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Start demo databases (seeds ~1M orders)
+        run: docker compose -f demo/docker-compose.yml up -d --wait --wait-timeout 300
+      - name: Run traffic for 20s
+        run: go run ./demo/traffic -rate 100 -duration 20s -report-every 10s -stats-every 10s
+      - name: Tear down
+        if: always()
+        run: docker compose -f demo/docker-compose.yml down -v

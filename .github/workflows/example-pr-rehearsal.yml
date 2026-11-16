@@ -1,0 +1,75 @@
+# Example: how a project wires pg-rehearse into its pull requests.
+#
+# One-time setup in your repo:
+#   1. Capture a profile from production (read-only role, no rows are exported):
+#        pg-rehearse profile --dsn "$PROD_RO_DSN" --out profile.json
+#   2. Store it as a secret:  base64 < profile.json | gh secret set PGR_PROFILE_B64
+#      (or publish it as an artifact from a scheduled workflow and download it here).
+#   3. Copy this file to .github/workflows/ and change `uses: ./` to
+#      `uses: pg-rehearse/pg-rehearse@v0` and `migrations:` to your layout.
+name: pg-rehearse (example)
+
+on:
+  pull_request:
+    paths:
+      - "demo/migrations/**.sql"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pg-rehearse-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    # Fork PRs get neither secrets nor a write token.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    services:
+      # Ephemeral shadow database. pg-rehearse fills it with synthetic data.
+      shadow:
+        image: postgres:17
+        env:
+          POSTGRES_USER: shadow
+          POSTGRES_PASSWORD: shadow
+          POSTGRES_DB: shadow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shadow -d shadow"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed to diff against the base branch
+
+      - name: Load production profile
+        id: profile
+        env:
+          PGR_PROFILE_B64: ${{ secrets.PGR_PROFILE_B64 }}
+        run: |
+          if [ -z "$PGR_PROFILE_B64" ]; then
+            echo "::notice::PGR_PROFILE_B64 secret not set; skipping rehearsal."
+            echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "$PGR_PROFILE_B64" | base64 -d > "$RUNNER_TEMP/profile.json"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # Alternative: profile from an artifact produced by a nightly workflow.
+      # - uses: actions/download-artifact@v4
+      #   with: { name: pg-rehearse-profile, path: ${{ runner.temp }}, run-id: ..., github-token: ${{ github.token }} }
+
+      - name: Rehearse changed migrations
+        if: steps.profile.outputs.ok == 'true'
+        uses: ./
+        with:
+          migrations: "demo/migrations/*.sql"
+          profile: ${{ runner.temp }}/profile.json
+          shadow-dsn: postgres://shadow:shadow@localhost:5432/shadow?sslmode=disable
+          scale: "0.1"
+          duration: 30s
+          fail-on: dangerous

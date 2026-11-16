@@ -1,0 +1,41 @@
+<!-- pg-rehearse:report -->
+### 🔴 This migration would have frozen **checkout** for **9.8s**
+
+`demo/migrations/004_alter_type.sql` · ran in 9.8s · rehearsed under peak-hour profile, 1,240 req/s, 1 long report txn
+
+| Feature | Normal p99 | Worst during migration | Stall | Errors | With safer version |
+|---|--:|--:|--:|--:|--:|
+| checkout | 4.2ms | 9.8s | **9.8s** | 12 | 1.2s, stalled 1.2s |
+| order page | 0.8ms | 9.8s | **9.8s** | 0 | 1.1ms |
+| `SELECT name \|\| price FROM products WHER…` | 0.5ms | 0.9ms | – | 0 | – |
+
+**Lock footprint:** Locks `orders` (blocks reads and writes), `users` (blocks writes) — table `orders` is rewritten.
+
+**Findings**
+
+- 🔴 `alter-column-type` — Changing a column type rewrites `orders` under an ACCESS EXCLUSIVE lock.
+- ℹ️ `missing-lock-timeout` — No lock_timeout is set; a blocked ALTER queues every query behind it. _SET lock_timeout = '2s';_
+
+❌ Re-tested: the suggested version still froze **checkout** for **1.2s**. It needs a human look.
+
+<details>
+<summary>Suggested safer migration (2 changes)</summary>
+
+- **lock-timeout** — Fail fast instead of queueing traffic behind the lock.
+- **alter-column-type** — Add a new column, backfill in batches, then swap.
+
+```sql
+-- lock-timeout
+SET lock_timeout = '2s';
+
+-- alter-column-type
+ALTER TABLE orders ADD COLUMN total_new numeric(14,2);
+-- backfill in batches, then:
+ALTER TABLE orders RENAME COLUMN total TO total_old;
+ALTER TABLE orders RENAME COLUMN total_new TO total;
+```
+
+</details>
+
+---
+<sub>🎭 <b>pg-rehearse</b> ran this migration against a synthetic, production-shaped copy of your database while replaying realistic traffic. No production data was read or modified.</sub>

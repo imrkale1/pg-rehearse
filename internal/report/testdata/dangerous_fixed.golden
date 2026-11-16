@@ -1,0 +1,33 @@
+<!-- pg-rehearse:report -->
+### 🔴 This migration would have frozen **checkout** for **3.1s**
+
+`demo/migrations/002_index_orders_created.sql` · ran in 3.1s · rehearsed under peak-hour profile, 1,240 req/s, 1 long report txn
+
+| Feature | Normal p99 | Worst during migration | Stall | With safer version |
+|---|--:|--:|--:|--:|
+| checkout | 4.2ms | 3.1s | **3.1s** | 41ms |
+| order history | 2.5ms | 6.1ms | – | 7.3ms |
+| order page | 0.8ms | 1.4ms | – | 1.9ms |
+
+**Lock footprint:** Locks `orders` (blocks writes).
+
+**Findings**
+
+- 🔴 `create-index-not-concurrent` — CREATE INDEX without CONCURRENTLY blocks writes to `orders` for the whole build. _Use CREATE INDEX CONCURRENTLY outside a transaction._
+
+✅ Re-tested: checkout max 41ms, no stalls (migration took 4.9s).
+
+<details>
+<summary>Suggested safer migration</summary>
+
+- **create-index-not-concurrent** — Build the index with CONCURRENTLY so writes keep flowing (must run outside a transaction).
+
+```sql
+-- create-index-not-concurrent
+CREATE INDEX CONCURRENTLY IF NOT EXISTS orders_created_at_idx ON orders (created_at);
+```
+
+</details>
+
+---
+<sub>🎭 <b>pg-rehearse</b> ran this migration against a synthetic, production-shaped copy of your database while replaying realistic traffic. No production data was read or modified.</sub>

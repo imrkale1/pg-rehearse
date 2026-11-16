@@ -1,0 +1,17 @@
+<!-- pg-rehearse:report -->
+### 💥 This migration failed during rehearsal
+
+`demo/migrations/005_not_null.sql` · rehearsed under peak-hour profile, 1,240 req/s
+
+The migration failed on the production-shaped shadow database, so it would most likely fail in production too:
+
+```text
+ERROR: column "user_id" of relation "orders" contains null values (SQLSTATE 23502)
+```
+
+**Findings**
+
+- 🟠 `set-not-null` — SET NOT NULL scans the whole table while holding an ACCESS EXCLUSIVE lock. _Add a CHECK (user_id IS NOT NULL) NOT VALID constraint, VALIDATE it, then SET NOT NULL._
+
+---
+<sub>🎭 <b>pg-rehearse</b> ran this migration against a synthetic, production-shaped copy of your database while replaying realistic traffic. No production data was read or modified.</sub>

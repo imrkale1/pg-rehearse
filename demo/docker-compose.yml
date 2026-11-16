@@ -1,0 +1,78 @@
+# Demo environment for pg-rehearse.
+#
+#   prod   - the "production" shop database: schema + ~1M orders + pg_stat_statements.
+#            pg-rehearse only ever reads statistics from it (never customer rows).
+#   shadow - an empty Postgres that pg-rehearse fills with synthetic, prod-shaped data
+#            and then rehearses migrations against under replayed traffic.
+#
+#   docker compose -f demo/docker-compose.yml up -d --wait
+name: pg-rehearse-demo
+
+services:
+  prod:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - pg_stat_statements.max=5000
+      - -c
+      - track_activity_query_size=4096
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - maintenance_work_mem=512MB
+    ports:
+      - "55440:5432"
+    volumes:
+      - ./prod:/docker-entrypoint-initdb.d:ro
+    shm_size: 1g
+    healthcheck:
+      # The entrypoint runs init scripts against a temporary socket-only server,
+      # so a TCP check only succeeds once seeding has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shop -d shop"]
+      interval: 3s
+      timeout: 5s
+      retries: 100
+      start_period: 180s
+
+  shadow:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: shadow
+      POSTGRES_PASSWORD: shadow
+      POSTGRES_DB: shadow
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - maintenance_work_mem=512MB
+      # Rehearsals measure lock waits, not durability.
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+    ports:
+      - "55441:5432"
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shadow -d shadow"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

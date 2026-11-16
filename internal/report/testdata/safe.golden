@@ -1,0 +1,15 @@
+<!-- pg-rehearse:report -->
+### 🟢 Safe — no feature was blocked while this migration ran
+
+`demo/migrations/001_add_column_safe.sql` · ran in 2.4ms · rehearsed under peak-hour profile, 1,240 req/s
+
+| Feature | Normal p99 | Worst during migration | Stall |
+|---|--:|--:|--:|
+| checkout | 4.2ms | 41ms | – |
+| order history | 2.5ms | 7.3ms | – |
+| order page | 0.8ms | 1.9ms | – |
+
+**Lock footprint:** Locks `orders` (blocks reads and writes).
+
+---
+<sub>🎭 <b>pg-rehearse</b> ran this migration against a synthetic, production-shaped copy of your database while replaying realistic traffic. No production data was read or modified.</sub>
