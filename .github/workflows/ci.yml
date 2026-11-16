@@ -11,27 +11,22 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: pgr_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d pgr_test"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 30
     env:
-      PGR_TEST_DSN: postgres://postgres:postgres@localhost:5432/pgr_test?sslmode=disable
+      PGR_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Started by hand (not a service container) so pg_stat_statements can be
+      # preloaded — the profile package needs it, and service containers cannot
+      # pass server flags.
+      - name: Start Postgres with pg_stat_statements
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            postgres:17 -c shared_preload_libraries=pg_stat_statements
+          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
       - name: gofmt
         run: |
           out="$(gofmt -l .)"

@@ -16,12 +16,23 @@ import (
 
 const lt = "SET lock_timeout = '2s';\n"
 
+// w renders a statement wrapped in the lock-retry loop exactly as it appears in
+// Apply's output (one statement = its text, a semicolon, a newline). It derives
+// from the production wrapRetry, so these expectations track the real template;
+// TestFixedMigrationsExecute independently proves the wrapped SQL runs.
+func w(stmt string) string { return wrapRetry(stmt) + ";\n" }
+
 // cases are shared by the unit test (exact output) and the integration test
 // (every output executes on a real server, statement by statement).
+//
+// Every statement that takes a read/write-blocking lock is wrapped in a
+// short-lock-timeout retry loop so it can never queue application queries
+// behind it; CONCURRENTLY and lone VALIDATE CONSTRAINT statements are not,
+// since they take only ShareUpdateExclusive.
 var cases = []struct {
 	name  string
 	in    string
-	rules []string // rules of the suggested fixes, in order
+	rules []string // Rule of each suggested fix, in order
 	want  string   // exact Apply output
 }{
 	{
@@ -39,22 +50,22 @@ var cases = []struct {
 	{
 		name:  "foreign key named",
 		in:    "ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE;",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddFKWithoutNotValid},
-		want: lt + "ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE NOT VALID;\n" +
+		rules: []string{locks.RuleAddFKWithoutNotValid},
+		want: w("ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT orders_user_fk;\n",
 	},
 	{
 		name:  "foreign key unnamed, quoted",
 		in:    `alter table "public"."Line Items" add foreign key ("Order Id") references public.orders(id)`,
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddFKWithoutNotValid},
-		want: lt + `alter table "public"."Line Items" ADD CONSTRAINT "Line Items_Order Id_fkey" foreign key ("Order Id") references public.orders(id) NOT VALID;` + "\n" +
+		rules: []string{locks.RuleAddFKWithoutNotValid},
+		want: w(`alter table "public"."Line Items" ADD CONSTRAINT "Line Items_Order Id_fkey" foreign key ("Order Id") references public.orders(id) NOT VALID`) +
 			`alter table "public"."Line Items" VALIDATE CONSTRAINT "Line Items_Order Id_fkey";` + "\n",
 	},
 	{
 		name:  "check named",
 		in:    "ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total >= 0);",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddCheckWithoutNotValid},
-		want: lt + "ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total >= 0) NOT VALID;\n" +
+		rules: []string{locks.RuleAddCheckWithoutNotValid},
+		want: w("ALTER TABLE orders ADD CONSTRAINT total_positive CHECK (total >= 0) NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT total_positive;\n",
 	},
 	{
@@ -62,40 +73,40 @@ var cases = []struct {
 		in:    "SET lock_timeout = '5s';\nALTER TABLE orders ALTER COLUMN user_id SET NOT NULL;",
 		rules: []string{locks.RuleSetNotNull},
 		want: "SET lock_timeout = '5s';\n" +
-			"ALTER TABLE orders ADD CONSTRAINT orders_user_id_not_null_chk CHECK (user_id IS NOT NULL) NOT VALID;\n" +
+			w("ALTER TABLE orders ADD CONSTRAINT orders_user_id_not_null_chk CHECK (user_id IS NOT NULL) NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT orders_user_id_not_null_chk;\n" +
-			"ALTER TABLE orders ALTER COLUMN user_id SET NOT NULL;\n" +
-			"ALTER TABLE orders DROP CONSTRAINT orders_user_id_not_null_chk;\n",
+			w("ALTER TABLE orders ALTER COLUMN user_id SET NOT NULL") +
+			w("ALTER TABLE orders DROP CONSTRAINT orders_user_id_not_null_chk"),
 	},
 	{
 		name:  "set not null quoted",
 		in:    `ALTER TABLE "Line Items" ALTER "Order Id" SET NOT NULL`,
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleSetNotNull},
-		want: lt + `ALTER TABLE "Line Items" ADD CONSTRAINT "Line Items_Order Id_not_null_chk" CHECK ("Order Id" IS NOT NULL) NOT VALID;` + "\n" +
+		rules: []string{locks.RuleSetNotNull},
+		want: w(`ALTER TABLE "Line Items" ADD CONSTRAINT "Line Items_Order Id_not_null_chk" CHECK ("Order Id" IS NOT NULL) NOT VALID`) +
 			`ALTER TABLE "Line Items" VALIDATE CONSTRAINT "Line Items_Order Id_not_null_chk";` + "\n" +
-			`ALTER TABLE "Line Items" ALTER "Order Id" SET NOT NULL;` + "\n" +
-			`ALTER TABLE "Line Items" DROP CONSTRAINT "Line Items_Order Id_not_null_chk";` + "\n",
+			w(`ALTER TABLE "Line Items" ALTER "Order Id" SET NOT NULL`) +
+			w(`ALTER TABLE "Line Items" DROP CONSTRAINT "Line Items_Order Id_not_null_chk"`),
 	},
 	{
 		name:  "add unique named",
 		in:    "ALTER TABLE users ADD CONSTRAINT users_email_uq UNIQUE (email);",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddUniqueConstraint},
-		want: lt + "CREATE UNIQUE INDEX CONCURRENTLY users_email_uq ON users (email);\n" +
-			"ALTER TABLE users ADD CONSTRAINT users_email_uq UNIQUE USING INDEX users_email_uq;\n",
+		rules: []string{locks.RuleAddUniqueConstraint},
+		want: "CREATE UNIQUE INDEX CONCURRENTLY users_email_uq ON users (email);\n" +
+			w("ALTER TABLE users ADD CONSTRAINT users_email_uq UNIQUE USING INDEX users_email_uq"),
 	},
 	{
 		name:  "add unique unnamed with options",
 		in:    "ALTER TABLE public.users ADD UNIQUE NULLS NOT DISTINCT (email, name) INCLUDE (id) DEFERRABLE INITIALLY DEFERRED;",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddUniqueConstraint},
-		want: lt + "CREATE UNIQUE INDEX CONCURRENTLY users_email_name_key ON public.users (email, name) INCLUDE (id) NULLS NOT DISTINCT;\n" +
-			"ALTER TABLE public.users ADD CONSTRAINT users_email_name_key UNIQUE USING INDEX users_email_name_key DEFERRABLE INITIALLY DEFERRED;\n",
+		rules: []string{locks.RuleAddUniqueConstraint},
+		want: "CREATE UNIQUE INDEX CONCURRENTLY users_email_name_key ON public.users (email, name) INCLUDE (id) NULLS NOT DISTINCT;\n" +
+			w("ALTER TABLE public.users ADD CONSTRAINT users_email_name_key UNIQUE USING INDEX users_email_name_key DEFERRABLE INITIALLY DEFERRED"),
 	},
 	{
 		name:  "add column volatile default",
 		in:    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS token uuid NOT NULL DEFAULT gen_random_uuid();",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddColumnVolatileDefault},
-		want: lt + "ALTER TABLE orders ADD COLUMN IF NOT EXISTS token uuid;\n" +
-			"ALTER TABLE orders ALTER COLUMN token SET DEFAULT gen_random_uuid();\n",
+		rules: []string{locks.RuleAddColumnVolatileDefault},
+		want: w("ALTER TABLE orders ADD COLUMN IF NOT EXISTS token uuid") +
+			w("ALTER TABLE orders ALTER COLUMN token SET DEFAULT gen_random_uuid()"),
 	},
 	{
 		name:  "alter column type: description only",
@@ -106,15 +117,15 @@ var cases = []struct {
 	{
 		name:  "multi-action alter keeps order and safe actions",
 		in:    "ALTER TABLE orders ADD COLUMN note text, ADD CONSTRAINT note_len CHECK (length(note) < 100), ALTER COLUMN status SET DEFAULT 'new', ALTER user_id SET NOT NULL;",
-		rules: []string{locks.RuleMissingLockTimeout, locks.RuleAddCheckWithoutNotValid},
-		want: lt + "ALTER TABLE orders ADD COLUMN note text;\n" +
-			"ALTER TABLE orders ADD CONSTRAINT note_len CHECK (length(note) < 100) NOT VALID;\n" +
+		rules: []string{locks.RuleAddCheckWithoutNotValid},
+		want: w("ALTER TABLE orders ADD COLUMN note text") +
+			w("ALTER TABLE orders ADD CONSTRAINT note_len CHECK (length(note) < 100) NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT note_len;\n" +
-			"ALTER TABLE orders ALTER COLUMN status SET DEFAULT 'new';\n" +
-			"ALTER TABLE orders ADD CONSTRAINT orders_user_id_not_null_chk CHECK (user_id IS NOT NULL) NOT VALID;\n" +
+			w("ALTER TABLE orders ALTER COLUMN status SET DEFAULT 'new'") +
+			w("ALTER TABLE orders ADD CONSTRAINT orders_user_id_not_null_chk CHECK (user_id IS NOT NULL) NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT orders_user_id_not_null_chk;\n" +
-			"ALTER TABLE orders ALTER user_id SET NOT NULL;\n" +
-			"ALTER TABLE orders DROP CONSTRAINT orders_user_id_not_null_chk;\n",
+			w("ALTER TABLE orders ALTER user_id SET NOT NULL") +
+			w("ALTER TABLE orders DROP CONSTRAINT orders_user_id_not_null_chk"),
 	},
 	{
 		name:  "drop index",
@@ -127,17 +138,18 @@ var cases = []struct {
 		in: "BEGIN;\nSET LOCAL lock_timeout = '3s';\n-- index for the dashboard\nCREATE INDEX orders_created_idx ON orders (created_at);\n" +
 			"ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id);\n" +
 			"ALTER TABLE orders ALTER COLUMN total TYPE bigint;\nALTER TABLE orders ADD COLUMN x int;\nCOMMIT;\n-- done\n",
-		rules: []string{locks.RuleCreateIndexNotConcurrent, locks.RuleAddFKWithoutNotValid, locks.RuleAlterColumnType},
+		rules: []string{locks.RuleCreateIndexNotConcurrent, locks.RuleAddFKWithoutNotValid, locks.RuleAlterColumnType, locks.RuleMissingLockTimeout},
 		want: "SET lock_timeout = '3s';\n-- index for the dashboard\nCREATE INDEX CONCURRENTLY orders_created_idx ON orders (created_at);\n" +
-			"ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID;\n" +
+			w("ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID") +
 			"ALTER TABLE orders VALIDATE CONSTRAINT orders_user_fk;\n" +
-			lt + "ALTER TABLE orders ALTER COLUMN total TYPE bigint;\nALTER TABLE orders ADD COLUMN x int;\n-- done\n",
+			lt + "ALTER TABLE orders ALTER COLUMN total TYPE bigint;\n" +
+			w("ALTER TABLE orders ADD COLUMN x int") + "-- done\n",
 	},
 	{
 		name:  "only lock_timeout missing",
 		in:    "ALTER TABLE orders ADD COLUMN x int;\nALTER TABLE users RENAME COLUMN name TO full_name;",
-		rules: []string{locks.RuleMissingLockTimeout},
-		want:  lt + "ALTER TABLE orders ADD COLUMN x int;\nALTER TABLE users RENAME COLUMN name TO full_name;\n",
+		rules: []string{locks.RuleMissingLockTimeout, locks.RuleMissingLockTimeout},
+		want:  w("ALTER TABLE orders ADD COLUMN x int") + w("ALTER TABLE users RENAME COLUMN name TO full_name"),
 	},
 	{
 		name:  "new table in same migration is left alone",
@@ -146,10 +158,12 @@ var cases = []struct {
 		want:  "CREATE TABLE audit (id bigint, order_id bigint);\nCREATE INDEX audit_idx ON audit (order_id);\nALTER TABLE audit ADD CONSTRAINT a CHECK (id > 0), ALTER COLUMN id SET NOT NULL;",
 	},
 	{
-		name:  "already safe",
+		name:  "not-valid add is still lock-guarded",
 		in:    lt + "CREATE INDEX CONCURRENTLY i ON orders (user_id);\nALTER TABLE orders ADD CONSTRAINT c CHECK (total >= 0) NOT VALID;\nALTER TABLE orders VALIDATE CONSTRAINT c;",
-		rules: nil,
-		want:  lt + "CREATE INDEX CONCURRENTLY i ON orders (user_id);\nALTER TABLE orders ADD CONSTRAINT c CHECK (total >= 0) NOT VALID;\nALTER TABLE orders VALIDATE CONSTRAINT c;",
+		rules: []string{locks.RuleMissingLockTimeout},
+		want: "SET lock_timeout = '2s';\nCREATE INDEX CONCURRENTLY i ON orders (user_id);\n" +
+			w("ALTER TABLE orders ADD CONSTRAINT c CHECK (total >= 0) NOT VALID") +
+			"ALTER TABLE orders VALIDATE CONSTRAINT c;\n",
 	},
 }
 

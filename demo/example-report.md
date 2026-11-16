@@ -1,14 +1,14 @@
 <!-- pg-rehearse:report -->
-### 🔴 This migration would have frozen **checkout** for **1.6s**
+### 🔴 This migration would have frozen **order history** for **6.5s**
 
-ran in 1.5s · rehearsed under 618 queries/s across 11 query shapes, 1 long-running transaction(s)
+ran in 6.2s · rehearsed under 603 queries/s across 11 query shapes, 1 long-running transaction(s)
 
 | Feature | Normal p99 | Worst during migration | Stall | With safer version |
 |---|--:|--:|--:|--:|
-| checkout | 2.9ms | 1.5s | **1.6s** | 1.5s, stalled 1.5s |
-| order history | 11ms | 1.5s | **1.6s** | 1.5s, stalled 1.5s |
-| view order | 2.4ms | 1.5s | **1.5s** | 1.5s, stalled 1.5s |
-| product page | 2.9ms | 1.3s | **1.4s** | 1.3s, stalled 1.3s |
+| order history | 5.5ms | 6.2s | **6.5s** | 100ms |
+| checkout | 2.3ms | 6.2s | **6.5s** | 102ms |
+| view order | 2.3ms | 6.2s | **6.5s** | 101ms |
+| product page | 4.5ms | 6s | **6.3s** | 38ms |
 
 **Lock footprint:** Locks `orders` (blocks reads and writes).
 
@@ -16,16 +16,38 @@ ran in 1.5s · rehearsed under 618 queries/s across 11 query shapes, 1 long-runn
 
 - 🟠 `missing-lock-timeout` — The migration takes locks that block application queries but never sets lock_timeout. If the lock is not granted immediately (e.g. a long-running report holds a conflicting lock), the DDL waits in the lock queue and every new query on the table queues behind it: an outage that lasts as long as the longest running transaction. _Start the migration with SET lock_timeout = '2s'; so it fails fast instead of blocking everyone, and retry it._
 
-❌ Re-tested: the suggested version still froze **checkout** for **1.5s**. It needs a human look.
+✅ Re-tested: order history max 100ms, no stalls (migration took 6.3s).
 
 <details>
 <summary>Suggested safer migration</summary>
 
-- **missing-lock-timeout** — Start with SET lock_timeout = '2s' so a DDL statement that cannot get its lock quickly fails (retry it later) instead of queueing every application query on the table behind it.
+- **missing-lock-timeout** — Take the lock in short attempts (SET LOCAL lock_timeout = '100ms' in a retry loop) instead of waiting indefinitely: each attempt blocks application queries for at most 100ms, and between attempts a conflicting transaction (e.g. a long-running report) can commit, so a brief DDL lock never turns into an outage.
 
 ```sql
 -- missing-lock-timeout
-SET lock_timeout = '2s';
+-- Safe: adding a nullable column without a default is a catalog-only change.
+-- It still takes an ACCESS EXCLUSIVE lock, but only for a few milliseconds
+-- (unless it has to queue behind a long transaction such as the admin report).
+DO $pgr$
+BEGIN
+  -- pg-rehearse: acquire the lock in short attempts so a slow concurrent
+  -- transaction cannot turn this DDL into an outage (see retryDesc).
+  FOR attempt IN 1..25 LOOP
+    BEGIN
+      SET LOCAL lock_timeout = '100ms';
+      -- Safe: adding a nullable column without a default is a catalog-only change.
+-- It still takes an ACCESS EXCLUSIVE lock, but only for a few milliseconds
+-- (unless it has to queue behind a long transaction such as the admin report).
+ALTER TABLE orders ADD COLUMN gift_message text;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      RAISE NOTICE 'pg-rehearse: lock busy, attempt % of 25', attempt;
+      PERFORM pg_sleep(2);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'pg-rehearse: could not acquire lock after 25 attempts';
+END
+$pgr$;
 ```
 
 </details>

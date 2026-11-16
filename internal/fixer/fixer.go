@@ -15,17 +15,88 @@ import (
 	"fmt"
 	"hash/fnv"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/pg-rehearse/pg-rehearse/internal/locks"
 	"github.com/pg-rehearse/pg-rehearse/internal/model"
 )
 
-// LockTimeoutSQL is prepended whenever blocking DDL remains.
+// LockTimeoutSQL is the fallback guard prepended when blocking DDL remains that
+// could not be wrapped in a retry loop.
 const LockTimeoutSQL = "SET lock_timeout = '2s'"
 
 // ruleLockTimeout is the rule id of the prepended lock_timeout fix.
 const ruleLockTimeout = locks.RuleMissingLockTimeout
+
+// Lock-retry parameters. A blocking DDL statement waits at most lockRetryTimeout
+// for its lock on each attempt, so it can never make application queries queue
+// behind it for longer than that. Between attempts it sleeps (holding no lock),
+// giving any conflicting transaction — a long report, say — time to finish.
+const (
+	lockRetryTimeout  = "100ms"
+	lockRetryAttempts = 25
+	lockRetrySleepSec = 2
+)
+
+const retryDesc = "Take the lock in short attempts (SET LOCAL lock_timeout = '" + lockRetryTimeout +
+	"' in a retry loop) instead of waiting indefinitely: each attempt blocks application queries for at most " +
+	lockRetryTimeout + ", and between attempts a conflicting transaction (e.g. a long-running report) can commit, so a brief DDL lock never turns into an outage."
+
+// wrapRetry wraps a single blocking DDL statement in a PL/pgSQL retry loop.
+// The statement runs as its own transaction (a DO block), so pg-rehearse's
+// orchestrator — and the user's migration tool — must run it in autocommit mode.
+func wrapRetry(stmt string) string {
+	stmt = strings.TrimRight(strings.TrimSpace(stmt), ";")
+	tmpl := `DO $pgr$
+BEGIN
+  -- pg-rehearse: acquire the lock in short attempts so a slow concurrent
+  -- transaction cannot turn this DDL into an outage (see retryDesc).
+  FOR attempt IN 1..__ATTEMPTS__ LOOP
+    BEGIN
+      SET LOCAL lock_timeout = '__TIMEOUT__';
+      __STMT__;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      RAISE NOTICE 'pg-rehearse: lock busy, attempt % of __ATTEMPTS__', attempt;
+      PERFORM pg_sleep(__SLEEP__);
+    END;
+  END LOOP;
+  RAISE EXCEPTION 'pg-rehearse: could not acquire lock after __ATTEMPTS__ attempts';
+END
+$pgr$`
+	return strings.NewReplacer(
+		"__ATTEMPTS__", strconv.Itoa(lockRetryAttempts),
+		"__TIMEOUT__", lockRetryTimeout,
+		"__SLEEP__", strconv.Itoa(lockRetrySleepSec),
+		"__STMT__", stmt,
+	).Replace(tmpl)
+}
+
+var alterTableHeadRe = regexp.MustCompile(`(?is)^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*ALTER\s+TABLE\b`)
+
+// needsRetry reports whether a (rewritten) statement takes a lock that blocks
+// reads or writes and should therefore be wrapped. CONCURRENTLY statements take
+// only ShareUpdateExclusive (no conflict with normal traffic), and a lone
+// VALIDATE CONSTRAINT is also ShareUpdateExclusive — neither needs a retry.
+func needsRetry(stmt string) bool {
+	if strings.Contains(strings.ToUpper(stmt), "CONCURRENTLY") {
+		return false
+	}
+	if !alterTableHeadRe.MatchString(stmt) {
+		return false
+	}
+	st := locks.Parse(stmt)
+	if st.Kind != locks.StmtAlterTable || len(st.Actions) == 0 {
+		return false
+	}
+	for _, a := range st.Actions {
+		if a.Kind != locks.ActValidate {
+			return true
+		}
+	}
+	return false
+}
 
 // Suggest proposes safer rewrites for the risky statements of migrationSQL.
 // fp (may be nil) is the footprint from locks.Analyze; it only enriches
@@ -203,12 +274,41 @@ func fixAlterTable(st *locks.Statement, state *locks.MigrationState, lead string
 		}
 	}
 	b.flush()
+
+	// Decide the statements to emit. With no structural rewrite, keep the
+	// original statement verbatim — but it may still take a blocking lock.
+	out := b.out
+	pureWrap := false
 	if !b.changed && !descOnly {
+		out = []string{st.SQL}
+		pureWrap = true
+	}
+
+	// Wrap each remaining blocking statement in a short-lock-timeout retry loop.
+	// descOnly (an unrewritable table rewrite) is left to the lock_timeout guard:
+	// a retry caps the wait for the lock, not the rewrite that runs once it is held.
+	if !descOnly {
+		wrapped := false
+		for i, s := range out {
+			if needsRetry(s) {
+				out[i] = wrapRetry(s)
+				wrapped = true
+			}
+		}
+		if wrapped {
+			b.rule(ruleLockTimeout, retryDesc)
+		} else if pureWrap {
+			return model.Fix{}, false // nothing structural and nothing blocking
+		}
+	}
+
+	if len(b.rules) == 0 {
 		return model.Fix{}, false
 	}
+
 	var rewritten string
-	if b.changed {
-		rewritten = joinStmts(lead, b.out)
+	if b.changed || pureWrap {
+		rewritten = joinStmts(lead, out)
 	} else {
 		rewritten = lead + st.SQL + ";"
 	}

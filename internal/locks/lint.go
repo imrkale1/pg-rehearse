@@ -164,7 +164,7 @@ func Lint(migrationSQL string) []model.LintFinding {
 				warnedTimeout = true
 				add(RuleMissingLockTimeout, model.SeverityWarning, sql,
 					"The migration takes locks that block application queries but never sets lock_timeout. If the lock is not granted immediately (e.g. a long-running report holds a conflicting lock), the DDL waits in the lock queue and every new query on the table queues behind it: an outage that lasts as long as the longest running transaction.",
-					"Start the migration with SET lock_timeout = '2s'; so it fails fast instead of blocking everyone, and retry it.")
+					"Take the lock with a short lock_timeout in a retry loop so each attempt blocks application queries only briefly and a conflicting transaction can finish between attempts, instead of letting the DDL wait indefinitely at the head of the lock queue.")
 			}
 			if inTxn {
 				txnBlocking = append(txnBlocking, sql)
