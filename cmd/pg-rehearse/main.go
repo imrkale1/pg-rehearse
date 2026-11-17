@@ -34,6 +34,7 @@ func main() {
 	root := &cobra.Command{
 		Use:           "pg-rehearse",
 		Short:         "Catch migration outages on the pull request, not in production",
+		Long:          "Rehearse Postgres migrations against a synthetic, production-shaped copy under realistic traffic before they reach production.",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,

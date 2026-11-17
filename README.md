@@ -129,8 +129,12 @@ profile, and posts a single sticky comment with the verdict.
 ```bash
 make build            # -> bin/pg-rehearse
 make test             # unit tests (no database needed)
+make lint             # go vet + gofmt check (no database needed)
 make test-integration # starts a throwaway Postgres and runs the full suite
 ```
+
+Tip: `./bin/pg-rehearse lint <migration.sql>` runs the static migration
+checks locally with no database required.
 
 Integration tests are gated on `PGR_TEST_DSN` and skip when it is unset.
 
