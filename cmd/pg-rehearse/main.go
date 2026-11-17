@@ -122,7 +122,7 @@ func rehearseCmd() *cobra.Command {
 	var (
 		profPath, shadow, migPath, format, outPath, failOn string
 		scale, rate                                        float64
-		duration                                           time.Duration
+		duration, maxStall                                 time.Duration
 		seed                                               int64
 		rebuild, noFix                                     bool
 		conns                                              int
@@ -166,8 +166,17 @@ func rehearseCmd() *cobra.Command {
 			} else if err := os.WriteFile(outPath, b, 0o644); err != nil {
 				return err
 			}
+			code := 0
 			if failed(rep.Original.Verdict, failOn) {
-				return exitError{2}
+				code = 2
+			}
+			if stallExceeded(rep.Original.MaxStallMs, maxStall) {
+				fmt.Fprintf(os.Stderr, "pg-rehearse: max stall %.0fms exceeds --max-stall %s\n",
+					rep.Original.MaxStallMs, maxStall)
+				code = 2
+			}
+			if code != 0 {
+				return exitError{code}
 			}
 			return nil
 		},
@@ -185,9 +194,19 @@ func rehearseCmd() *cobra.Command {
 	c.Flags().StringVar(&format, "format", "markdown", "markdown | json")
 	c.Flags().StringVar(&outPath, "out", "-", "output file (- for stdout)")
 	c.Flags().StringVar(&failOn, "fail-on", "dangerous", "exit 2 when verdict is at least: risky | dangerous | never")
+	c.Flags().DurationVar(&maxStall, "max-stall", 0, "exit 2 when any feature stalls longer than this, e.g. 500ms (0 disables)")
 	_ = c.MarkFlagRequired("migration")
 	_ = c.MarkFlagRequired("shadow-dsn")
 	return c
+}
+
+// stallExceeded reports whether the measured worst stall is over the limit.
+// A zero or negative limit disables the check.
+func stallExceeded(maxStallMs float64, limit time.Duration) bool {
+	if limit <= 0 {
+		return false
+	}
+	return maxStallMs > float64(limit)/float64(time.Millisecond)
 }
 
 func failed(v model.Verdict, failOn string) bool {

@@ -116,6 +116,20 @@ track, across many PRs, how often migrations would have caused an outage.
 
 ## Use it in CI
 
+### Fail the build on a stall budget
+
+`--fail-on` gates on the verdict. To gate on a hard latency budget instead, pass
+`--max-stall`: `rehearse` exits with code 2 when any feature stalls longer than
+the limit while the original migration runs.
+
+```bash
+./bin/pg-rehearse rehearse --profile shop.profile.json --shadow-dsn ... \
+  --migration m.sql --max-stall 500ms
+# pg-rehearse: max stall 6500ms exceeds --max-stall 500ms   (exit 2)
+```
+
+In the GitHub Action, set the `max-stall` input (for example `max-stall: 500ms`).
+
 [`action.yml`](action.yml) is a composite GitHub Action, and
 [`.github/workflows/example-pr-rehearsal.yml`](.github/workflows/example-pr-rehearsal.yml)
 shows wiring it up: on a PR that touches migration files, it spins up an

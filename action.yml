@@ -25,6 +25,9 @@ inputs:
   fail-on:
     description: "Fail the job on this verdict or worse: dangerous, risky, or never."
     default: dangerous
+  max-stall:
+    description: "Fail the job when any feature stalls longer than this duration (e.g. 500ms, 2s). Empty disables."
+    default: ""
   github-token:
     description: Token used to post the PR comment (needs pull-requests:write).
     default: ${{ github.token }}
@@ -75,10 +78,15 @@ runs:
         SHADOW_DSN: ${{ inputs.shadow-dsn }}
         SCALE: ${{ inputs.scale }}
         DURATION: ${{ inputs.duration }}
+        MAX_STALL: ${{ inputs.max-stall }}
       run: |
         report="$RUNNER_TEMP/pg-rehearse-report.md"
         echo "<!-- pg-rehearse:sticky -->" > "$report"
         worst=safe
+        stalled=false
+        # --fail-on never so that, with --max-stall, exit 2 means only "stall over the limit".
+        stall_args=(--fail-on never)
+        [ -n "$MAX_STALL" ] && stall_args+=(--max-stall "$MAX_STALL")
         rank() { case "$1" in error) echo 3;; dangerous) echo 2;; risky) echo 1;; *) echo 0;; esac; }
         while IFS= read -r file; do
           [ -n "$file" ] || continue
@@ -86,7 +94,9 @@ runs:
           out="$RUNNER_TEMP/one.md"
           if "$RUNNER_TEMP/pg-rehearse" rehearse \
               --profile "$PROFILE" --shadow-dsn "$SHADOW_DSN" --migration "$file" \
-              --scale "$SCALE" --duration "$DURATION" --format markdown > "$out"; then :; else
+              --scale "$SCALE" --duration "$DURATION" --format markdown "${stall_args[@]}" > "$out"; then :; else
+            code=$?
+            [ "$code" -eq 2 ] && [ -s "$out" ] && stalled=true
             # A non-zero exit with a rendered report is a verdict; without one it is a tool failure.
             [ -s "$out" ] || printf '### ⚠️ pg-rehearse could not rehearse `%s`\n\nSee the job log for details.\n' "$file" > "$out"
           fi
@@ -104,6 +114,7 @@ runs:
         done < "$RUNNER_TEMP/pgr-changed.txt"
         cat "$report" >> "$GITHUB_STEP_SUMMARY"
         echo "verdict=$worst" >> "$GITHUB_OUTPUT"
+        echo "stalled=$stalled" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
 
     - name: Post sticky PR comment
@@ -133,7 +144,12 @@ runs:
       env:
         VERDICT: ${{ steps.rehearse.outputs.verdict }}
         FAIL_ON: ${{ inputs.fail-on }}
+        STALLED: ${{ steps.rehearse.outputs.stalled }}
+        MAX_STALL: ${{ inputs.max-stall }}
       run: |
+        if [ "$STALLED" = "true" ]; then
+          echo "::error::pg-rehearse: a migration stalled a feature longer than max-stall ($MAX_STALL)"; exit 1
+        fi
         case "$FAIL_ON:$VERDICT" in
           never:*) exit 0 ;;
           risky:risky|risky:dangerous|risky:error|dangerous:dangerous|dangerous:error)
